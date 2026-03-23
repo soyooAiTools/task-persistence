@@ -1,0 +1,14 @@
+{
+  "id": "task-persistence",
+  "kind": "utility",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dataDir": {
+        "type": "string",
+        "description": "Directory for persistence files (default: workspace root)"
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@openclaw/task-persistence",
+  "version": "1.0.0",
+  "description": "Task persistence plugin — survives gateway restarts. Layer 1 (pending reply) + Layer 2 (active task checkpoints).",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
