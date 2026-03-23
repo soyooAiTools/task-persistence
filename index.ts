@@ -1,10 +1,9 @@
 /**
  * task-persistence — OpenClaw plugin
  *
+ * Layer 0: On gateway_start, checks for leftover pending-reply.json and sends
+ *          a Feishu App API message to the correct chat to trigger recovery.
  * Layer 1: Writes pending-reply.json on before_agent_start, deletes on agent_end.
- *          On gateway_start, checks for leftover pending-reply and sends a
- *          Feishu webhook notification to trigger recovery.
- *
  * Layer 2: Reads active-task.json on before_agent_start and injects resume context.
  */
 
@@ -29,19 +28,116 @@ interface ActiveTask {
   updatedAt: string;
 }
 
-// Feishu custom bot webhook for recovery notifications
-const FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/b9c59492-4949-4950-a34b-913bf1c7df08";
+// ── Feishu App API ──────────────────────────────────────────
 
-// Map session keys to Feishu chat IDs for targeted recovery
-// Format: "agent:main:feishu:direct:ou_xxx" → send to user ou_xxx
-// Format: "agent:main:feishu:group:oc_xxx" → send to group oc_xxx
-function extractFeishuTarget(sessionKey: string): { type: "user" | "group"; id: string } | null {
+interface FeishuConfig {
+  appId: string;
+  appSecret: string;
+}
+
+let cachedToken: { token: string; expiresAt: number } | null = null;
+
+async function getFeishuTenantToken(cfg: FeishuConfig, logger: { info: (m: string) => void; warn: (m: string) => void }): Promise<string | null> {
+  if (cachedToken && Date.now() < cachedToken.expiresAt - 60000) {
+    return cachedToken.token;
+  }
+  try {
+    const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
+    });
+    const data = await res.json() as { code?: number; tenant_access_token?: string; expire?: number };
+    if (data.code === 0 && data.tenant_access_token) {
+      cachedToken = {
+        token: data.tenant_access_token,
+        expiresAt: Date.now() + (data.expire ?? 7200) * 1000,
+      };
+      logger.info("task-persistence: feishu tenant token acquired");
+      return cachedToken.token;
+    }
+    logger.warn(`task-persistence: feishu token error: code=${data.code}`);
+    return null;
+  } catch (err) {
+    logger.warn(`task-persistence: feishu token fetch failed: ${String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Send a message via Feishu App API.
+ * @param receiveIdType "open_id" for DM, "chat_id" for group
+ * @param receiveId the ou_xxx or oc_xxx id
+ */
+async function sendFeishuMessage(
+  cfg: FeishuConfig,
+  receiveIdType: "open_id" | "chat_id",
+  receiveId: string,
+  text: string,
+  logger: { info: (m: string) => void; warn: (m: string) => void },
+): Promise<boolean> {
+  const token = await getFeishuTenantToken(cfg, logger);
+  if (!token) return false;
+
+  try {
+    const res = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=${receiveIdType}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          receive_id: receiveId,
+          msg_type: "text",
+          content: JSON.stringify({ text }),
+        }),
+      },
+    );
+    const data = await res.json() as { code?: number; msg?: string };
+    if (data.code === 0) {
+      logger.info(`task-persistence: feishu message sent to ${receiveIdType}:${receiveId}`);
+      return true;
+    }
+    logger.warn(`task-persistence: feishu send failed: code=${data.code} msg=${data.msg}`);
+    return false;
+  } catch (err) {
+    logger.warn(`task-persistence: feishu send error: ${String(err)}`);
+    return false;
+  }
+}
+
+/** Extract Feishu target from session key. */
+function parseFeishuTarget(sessionKey: string): { type: "open_id" | "chat_id"; id: string } | null {
   const directMatch = sessionKey.match(/feishu:direct:(ou_[a-f0-9]+)/);
-  if (directMatch) return { type: "user", id: directMatch[1]! };
+  if (directMatch) return { type: "open_id", id: directMatch[1]! };
   const groupMatch = sessionKey.match(/feishu:group:(oc_[a-f0-9]+)/);
-  if (groupMatch) return { type: "group", id: groupMatch[1]! };
+  if (groupMatch) return { type: "chat_id", id: groupMatch[1]! };
   return null;
 }
+
+/** Read Feishu credentials from OpenClaw config. */
+function readFeishuConfig(config: Record<string, unknown>): FeishuConfig | null {
+  try {
+    const channels = config.channels as Record<string, unknown> | undefined;
+    const feishu = channels?.feishu as Record<string, unknown> | undefined;
+    const accounts = feishu?.accounts as Record<string, unknown> | undefined;
+    if (!accounts) return null;
+    // Find first account with appId + appSecret
+    for (const account of Object.values(accounts)) {
+      const acc = account as Record<string, unknown>;
+      if (typeof acc?.appId === "string" && typeof acc?.appSecret === "string") {
+        return { appId: acc.appId, appSecret: acc.appSecret };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Utility ──────────────────────────────────────────────────
 
 function safeRead<T>(filePath: string): T | null {
   try {
@@ -57,17 +153,13 @@ function safeWrite(filePath: string, data: unknown): void {
     const dir = dirname(filePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
-  } catch {
-    // silent
-  }
+  } catch {}
 }
 
 function safeDelete(filePath: string): void {
   try {
     if (existsSync(filePath)) unlinkSync(filePath);
-  } catch {
-    // silent
-  }
+  } catch {}
 }
 
 function truncate(text: string, max = 200): string {
@@ -101,99 +193,75 @@ function isSkippable(text: string): boolean {
   return false;
 }
 
-/** Send a Feishu webhook message (custom bot). */
-async function sendFeishuWebhook(text: string, logger: { info: (m: string) => void; warn: (m: string) => void }): Promise<boolean> {
-  try {
-    const res = await fetch(FEISHU_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        msg_type: "text",
-        content: { text },
-      }),
-    });
-    if (res.ok) {
-      logger.info(`task-persistence: feishu webhook sent (${res.status})`);
-      return true;
-    }
-    logger.warn(`task-persistence: feishu webhook failed (${res.status})`);
-    return false;
-  } catch (err) {
-    logger.warn(`task-persistence: feishu webhook error: ${String(err)}`);
-    return false;
-  }
-}
+// ── Plugin ───────────────────────────────────────────────────
 
 const taskPersistencePlugin = {
   id: "task-persistence",
   name: "Task Persistence",
-  description: "Survives gateway restarts — Layer 1 (pending reply) + Layer 2 (active task checkpoints)",
+  description: "Survives gateway restarts — auto-recovery via Feishu App API",
   kind: "utility" as const,
 
   register(api: OpenClawPluginApi) {
     const cfg = (api.pluginConfig ?? {}) as { dataDir?: string };
     const dataDir = cfg.dataDir || api.resolvePath("~/.openclaw/workspace");
+    const feishuCfg = readFeishuConfig(api.config as unknown as Record<string, unknown>);
 
     const pendingPath = join(dataDir, "pending-reply.json");
     const taskPath = join(dataDir, "active-task.json");
 
-    api.logger.info(`task-persistence: initialized (dataDir=${dataDir})`);
+    api.logger.info(`task-persistence: initialized (dataDir=${dataDir}, feishu=${feishuCfg ? "ok" : "no-credentials"})`);
 
     // ── Layer 0: Gateway Start Recovery ──────────────────────────
 
-    api.on("gateway_start", async (event) => {
-      // Wait for channels to initialize
-      await new Promise(r => setTimeout(r, 8000));
+    api.on("gateway_start", async (_event) => {
+      await new Promise(r => setTimeout(r, 10000)); // wait for channels
 
       const pending = safeRead<PendingReply>(pendingPath);
       if (!pending) {
-        api.logger.info("task-persistence: gateway_start — no pending reply found");
+        api.logger.info("task-persistence: gateway_start — no pending reply");
         return;
       }
 
       const elapsed = Date.now() - new Date(pending.startedAt).getTime();
       const minutes = Math.round(elapsed / 60000);
 
-      // Too old (> 24h) — just clean up
       if (elapsed > 86400000) {
-        api.logger.info(`task-persistence: gateway_start — pending reply too old (${minutes}min), cleaning up`);
+        api.logger.info(`task-persistence: gateway_start — pending too old (${minutes}min), cleanup`);
         safeDelete(pendingPath);
         return;
       }
 
-      api.logger.info(`task-persistence: gateway_start — found pending reply (${minutes}min old): "${truncate(pending.userMessage, 80)}"`);
+      api.logger.info(`task-persistence: gateway_start — found pending (${minutes}min): "${truncate(pending.userMessage, 80)}"`);
 
-      // Build recovery message
-      const msgPreview = truncate(pending.userMessage, 100);
-      let notifyText: string;
-
-      if (elapsed < 1800000) {
-        // < 30 min — auto-recover
-        notifyText = `⚠️ 网关刚重启，你 ${minutes} 分钟前的消息没回复上：\n「${msgPreview}」\n正在重新处理...`;
-      } else {
-        // 30min ~ 24h — ask user
-        notifyText = `⚠️ 网关重启恢复通知：你 ${minutes} 分钟前的消息未回复：\n「${msgPreview}」\n需要我重新处理吗？`;
+      // Try to send via Feishu App API
+      const target = parseFeishuTarget(pending.sessionKey);
+      if (!target || !feishuCfg) {
+        api.logger.warn(`task-persistence: cannot recover — target=${target?.id ?? "none"}, feishu=${feishuCfg ? "ok" : "none"}`);
+        return;
       }
 
-      // Send via Feishu webhook
-      const sent = await sendFeishuWebhook(notifyText, api.logger);
+      const msgPreview = truncate(pending.userMessage, 100);
+      const notifyText = elapsed < 1800000
+        ? `⚠️ 网关刚重启，你 ${minutes} 分钟前的消息没回复上：\n「${msgPreview}」\n我来重新处理...`
+        : `⚠️ 网关重启恢复：你 ${minutes} 分钟前的消息未回复：\n「${msgPreview}」\n需要我重新处理吗？`;
+
+      const sent = await sendFeishuMessage(feishuCfg, target.type, target.id, notifyText, api.logger);
 
       if (sent) {
-        api.logger.info("task-persistence: recovery notification sent via feishu webhook");
-        // Don't delete pending-reply yet — let the agent handle it via HEARTBEAT
-        // or the user will reply and trigger normal flow
+        api.logger.info(`task-persistence: recovery message sent to ${target.type}:${target.id}`);
+        // Clear pending — the sent message will trigger the agent in that session
+        safeDelete(pendingPath);
       }
 
-      // Also check active-task
+      // Also notify about active-task
       const task = safeRead<ActiveTask>(taskPath);
-      if (task) {
+      if (task && feishuCfg) {
         const taskElapsed = Date.now() - new Date(task.updatedAt || task.startedAt).getTime();
         if (taskElapsed < 86400000) {
-          const taskMinutes = Math.round(taskElapsed / 60000);
+          const taskMin = Math.round(taskElapsed / 60000);
           const step = task.steps.find(s => s.status === "running") ?? task.steps.find(s => s.status === "pending");
-          const stepLabel = step ? `当前步骤：${step.label}` : "";
-          await sendFeishuWebhook(
-            `📋 还有一个未完成的任务（${taskMinutes}分钟前中断）：\n${task.description}\n进度：${task.currentStep}/${task.steps.length}\n${stepLabel}`,
+          await sendFeishuMessage(feishuCfg, target.type, target.id,
+            `📋 还有未完成的任务（${taskMin}分钟前中断）：\n${task.description}\n进度：${task.currentStep}/${task.steps.length}${step ? `\n当前：${step.label}` : ""}`,
             api.logger,
           );
         }
@@ -216,12 +284,11 @@ const taskPersistencePlugin = {
       safeWrite(pendingPath, pending);
       api.logger.info(`task-persistence: pending-reply written (${truncate(userText, 80)})`);
 
-      // ── Layer 2: Inject active-task context if present ──
+      // ── Layer 2: Inject active-task context ──
       const task = safeRead<ActiveTask>(taskPath);
       if (task) {
         const elapsed = Date.now() - new Date(task.updatedAt || task.startedAt).getTime();
-        const hours = elapsed / 3600000;
-        if (hours < 24) {
+        if (elapsed < 86400000) {
           const done = task.steps.filter(s => s.status === "done").map(s => `  ✅ ${s.label}`).join("\n");
           const remaining = task.steps.filter(s => s.status !== "done").map(s => `  ⬜ ${s.label}`).join("\n");
           const context = [
